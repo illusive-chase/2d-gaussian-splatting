@@ -10,18 +10,21 @@
 #
 
 import os
-import torch
-from random import randint
-from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
 import sys
-from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
 import uuid
-from tqdm import tqdm
-from utils.image_utils import psnr, render_net_image
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
+from random import randint
+
+import torch
+from tqdm import tqdm
+
+from arguments import ModelParams, OptimizationParams, PipelineParams
+from gaussian_renderer import network_gui, render
+from scene import GaussianModel, Scene
+from utils.general_utils import safe_state
+from utils.image_utils import psnr, render_net_image
+from utils.loss_utils import l1_loss, ssim
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -38,8 +41,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -66,10 +67,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         
+        background = torch.rand((3,), dtype=torch.float32, device="cuda")
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
         gt_image = viewpoint_cam.original_image.cuda()
+        assert gt_image.shape[-3] == 4
+        gt_image = gt_image[..., :3, :, :] * gt_image[..., 3:, :, :] + (1 - gt_image[..., 3:, :, :]) * background.view(3, 1, 1)
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
@@ -163,7 +167,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     network_gui.send(net_image_bytes, dataset.source_path, metrics_dict)
                     if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
                         break
-                except Exception as e:
+                except Exception:
                     # raise e
                     network_gui.conn = None
 
@@ -211,6 +215,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0).to("cuda")
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    bg = renderArgs[-1]
+                    gt_image = gt_image[..., :3, :, :] * gt_image[..., 3:, :, :] + (1 - gt_image[..., 3:, :, :]) * bg.view(3, 1, 1)
                     if tb_writer and (idx < 5):
                         from utils.general_utils import colormap
                         depth = render_pkg["surf_depth"]
